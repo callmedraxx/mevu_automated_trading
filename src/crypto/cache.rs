@@ -1,7 +1,9 @@
 use crate::crypto::types::CryptoMarket;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
 pub struct CryptoMarketsCache {
     memory: Arc<DashMap<String, CachedMarkets>>,
@@ -21,7 +23,11 @@ impl CryptoMarketsCache {
 
     pub fn get(&self, key: &str) -> Option<Vec<CryptoMarket>> {
         if let Some(cached) = self.memory.get(key) {
-            return Some(cached.data.clone());
+            if cached.fetched_at.elapsed() < CACHE_TTL {
+                return Some(cached.data.clone());
+            }
+            drop(cached);
+            self.memory.remove(key);
         }
         None
     }
@@ -30,9 +36,13 @@ impl CryptoMarketsCache {
         self.memory.insert(
             key.to_string(),
             CachedMarkets {
-                data: data.clone(),
+                data,
                 fetched_at: Instant::now(),
             },
         );
+    }
+
+    pub fn clear(&self) {
+        self.memory.clear();
     }
 }
