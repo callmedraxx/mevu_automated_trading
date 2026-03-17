@@ -37,6 +37,18 @@ pub async fn fetch_balance(
         .map_err(|e| format!("Failed to parse MEVU balance: {}", e))
 }
 
+/// Shape of the market info object expected by MEVU's /api/trading/buy and /api/trading/sell
+#[derive(Debug, Serialize)]
+pub struct MevuMarketInfo<'a> {
+    #[serde(rename = "marketId")]
+    pub market_id: &'a str,
+    #[serde(rename = "marketQuestion")]
+    pub market_question: &'a str,
+    #[serde(rename = "clobTokenId")]
+    pub clob_token_id: &'a str,
+    pub outcome: &'a str,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct BalanceResponse {
     pub success: bool,
@@ -87,6 +99,9 @@ pub struct Position {
     pub id: Option<String>,
     pub title: Option<String>,
     pub outcome: Option<String>,
+    pub asset: Option<String>,
+    #[serde(rename = "conditionId")]
+    pub condition_id: Option<String>,
     pub size: Option<String>,
     #[serde(rename = "currentValue")]
     pub current_value: Option<String>,
@@ -95,6 +110,61 @@ pub struct Position {
     #[serde(rename = "percentPnl")]
     pub percent_pnl: Option<String>,
     pub redeemable: Option<bool>,
+}
+
+/// Redeemable position returned by MEVU GET /api/trading/redeem/available
+#[derive(Debug, Deserialize, Clone)]
+pub struct RedeemablePosition {
+    pub asset: String,
+    #[serde(rename = "conditionId")]
+    pub condition_id: String,
+    pub size: String,
+    #[serde(rename = "currentValue")]
+    pub current_value: String,
+    pub title: String,
+    pub outcome: String,
+    #[serde(rename = "eventId")]
+    pub event_id: Option<String>,
+}
+
+/// Fetch redeemable positions from MEVU GET /api/trading/redeem/available?privyUserId=...
+pub async fn fetch_redeemable_positions(
+    http_client: &Client,
+    privy_user_id: &str,
+) -> Result<Vec<RedeemablePosition>, String> {
+    let base = mevu_base_url()?;
+    let url = format!(
+        "{}/api/trading/redeem/available?privyUserId={}",
+        base.trim_end_matches('/'),
+        urlencoding::encode(privy_user_id)
+    );
+
+    let response = http_client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("MEVU redeemable positions fetch failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "MEVU redeemable positions returned {}: {}",
+            status, body
+        ));
+    }
+
+    #[derive(Deserialize)]
+    struct Wrapper {
+        positions: Option<Vec<RedeemablePosition>>,
+    }
+
+    let wrapper: Wrapper = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse MEVU redeemable positions: {}", e))?;
+
+    Ok(wrapper.positions.unwrap_or_default())
 }
 
 /// Fetch PnL snapshot from MEVU GET /api/positions/:privyUserId/pnl/current
@@ -164,4 +234,18 @@ pub fn compute_winrate_from_positions(positions: &[Position]) -> f64 {
         return 0.0;
     }
     (wins as f64 / total as f64) * 100.0
+}
+
+/// Helper outcome mapper for crypto up/down markets.
+/// MEVU's trading API expects a human-readable outcome string; for our
+/// crypto up/down markets we map:
+/// - "up"   → "Yes"
+/// - "down" → "No"
+/// - any other fallback → "Yes"
+pub fn outcome_from_side(side: &str) -> &'static str {
+    match side {
+        "up" => "Yes",
+        "down" => "No",
+        _ => "Yes",
+    }
 }

@@ -318,3 +318,18 @@ pub async fn get_bot_user(db: &sqlx::PgPool) -> Result<Option<BotUser>, String> 
 
     Ok(row.as_ref().map(row_to_bot_user))
 }
+
+/// Get a bot user by their ID
+pub async fn get_bot_user_by_id(db: &sqlx::PgPool, user_id: &str) -> Result<Option<BotUser>, String> {
+    let row = sqlx::query(
+        "SELECT id, privy_user_id, email, embedded_wallet_address, proxy_wallet_address,
+                is_active, created_at, updated_at
+         FROM bot_users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("DB query error: {}", e))?;
+
+    Ok(row.as_ref().map(row_to_bot_user))
+}

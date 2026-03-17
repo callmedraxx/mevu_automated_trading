@@ -4,7 +4,7 @@ use crate::crypto::clob_websocket::{self, PriceCache, TokenMap};
 use crate::crypto::gamma_client::fetch_all_crypto_events;
 use crate::crypto::types::*;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::time::{self, Duration};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 hour
@@ -31,6 +31,12 @@ pub struct AppState {
     pub chainlink_tx: tokio::sync::broadcast::Sender<String>,
     /// Ring-buffer of recent BTC price history (last 1 hour)
     pub btc_price_history: BtcPriceHistory,
+    /// Notify handle: trigger CLOB WebSocket to immediately reconnect with latest token map
+    pub clob_reconnect: Arc<Notify>,
+    /// Per-user bot config cache: user_id → BotConfig (read by trading engine on every tick)
+    pub bot_configs: crate::bot_config::service::ConfigCache,
+    /// Broadcast channel for balance updates: sends JSON { user_id, privy_user_id, balance, type } to SSE clients
+    pub balance_tx: tokio::sync::broadcast::Sender<String>,
 }
 
 impl AppState {
@@ -40,6 +46,7 @@ impl AppState {
         let (chainlink_tx, _) = tokio::sync::broadcast::channel::<String>(512);
         start_chainlink_ws(chainlink_btc.clone(), chainlink_tx.clone(), btc_price_history.clone());
         let (price_updates_tx, _) = tokio::sync::broadcast::channel(512);
+        let (balance_tx, _) = tokio::sync::broadcast::channel(256);
 
         Arc::new(Self {
             markets: RwLock::new(Vec::new()),
@@ -52,6 +59,9 @@ impl AppState {
             price_updates_tx,
             chainlink_tx,
             btc_price_history,
+            clob_reconnect: Arc::new(Notify::new()),
+            bot_configs: crate::bot_config::service::ConfigCache::default(),
+            balance_tx,
         })
     }
 }
@@ -199,6 +209,20 @@ pub fn transform_events(events: Vec<GammaEvent>) -> Vec<CryptoMarket> {
         let (up_token, down_token) = first_market.map(|m| parse_clob_token_ids(m)).unwrap_or((None, None));
         let direction = determine_direction(up_price, down_price);
 
+        // Derive start_time from end_date if missing (e.g., 1h markets from Gamma API)
+        let start_time = event.start_time.clone().or_else(|| {
+            let end_str = event.end_date.as_ref()?;
+            let end_dt = parse_dt(end_str)?;
+            let duration = match tf {
+                Timeframe::FiveMin => chrono::Duration::minutes(5),
+                Timeframe::FifteenMin => chrono::Duration::minutes(15),
+                Timeframe::OneHour => chrono::Duration::hours(1),
+                Timeframe::FourHour => chrono::Duration::hours(4),
+                Timeframe::Weekly => chrono::Duration::weeks(1),
+            };
+            Some((end_dt - duration).to_rfc3339())
+        });
+
         markets.push(CryptoMarket {
             id: event.id.clone(),
             slug: event.slug.clone(),
@@ -213,7 +237,7 @@ pub fn transform_events(events: Vec<GammaEvent>) -> Vec<CryptoMarket> {
             series_slug: event.series_slug.clone(),
             start_date: event.start_date.clone(),
             end_date: event.end_date.clone(),
-            start_time: event.start_time.clone(),
+            start_time,
             up_clob_token_id: up_token,
             down_clob_token_id: down_token,
         });
@@ -279,6 +303,9 @@ pub async fn refresh_markets(state: &Arc<AppState>) -> Result<usize, Box<dyn std
 
     clob_websocket::rebuild_token_map(&state.token_map, &btc_markets);
 
+    // Trigger immediate CLOB reconnect so new tokens are subscribed right away
+    state.clob_reconnect.notify_one();
+
     {
         let mut lock = state.markets.write().await;
         *lock = btc_markets;
@@ -306,8 +333,8 @@ async fn store_markets_in_db(pool: &sqlx::PgPool, markets: &[CryptoMarket]) -> R
             ON CONFLICT (id) DO UPDATE SET
                 title = EXCLUDED.title,
                 direction = EXCLUDED.direction,
-                up_price = EXCLUDED.up_price,
-                down_price = EXCLUDED.down_price,
+                up_price = COALESCE(EXCLUDED.up_price, crypto_markets.up_price),
+                down_price = COALESCE(EXCLUDED.down_price, crypto_markets.down_price),
                 volume = EXCLUDED.volume,
                 liquidity = EXCLUDED.liquidity,
                 series_slug = EXCLUDED.series_slug,
@@ -443,12 +470,13 @@ async fn market_lifecycle_monitor(state: Arc<AppState>) {
 
 /// Start the auto-refresh background task + CLOB WebSocket + lifecycle monitor
 pub fn start_auto_refresh(state: Arc<AppState>) {
-    // Start CLOB WebSocket for real-time prices (immediate DB updates, WS broadcast)
+    // Start CLOB WebSocket for real-time prices (instant frontend broadcast, batched DB writes)
     clob_websocket::start_clob_websocket(
         state.token_map.clone(),
         state.price_cache.clone(),
         state.db.clone(),
         state.price_updates_tx.clone(),
+        state.clob_reconnect.clone(),
     );
 
     // Start market lifecycle monitor (records opening/closing BTC prices from Chainlink)
